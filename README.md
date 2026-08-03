@@ -1,101 +1,109 @@
 # ComfyUI Sol-Attn (SM120 / RTX 5090) — MiniMax H3
 
-Sol-Attn（Sparsified On-the-fly Attention）稀疏注意力加速，专门为 **NVIDIA RTX 5090 (SM120)** 上的 **MiniMax H3 视频生成**工作流实现。
+Sol-Attn (Sparsified On-the-fly Attention) sparse-attention acceleration, built specifically for **MiniMax H3 video generation** on **NVIDIA RTX 5090 (SM120)**.
 
-本插件通过 PyTorch 的 `flex_attention`（`torch.compile` 后生成 FlashAttention-3 风格内核）执行 Sol-Attn 的稀疏路由，在长序列上相比标准 SDPA 有显著加速。
+This plugin performs Sol-Attn's sparse routing through PyTorch's `flex_attention` (which lowers to FlashAttention-3-style kernels via `torch.compile`), giving significant speedups over standard SDPA on long sequences.
 
-## 特性
+## Features
 
-- **SM120 原生优化**：flex_attention 编译内核，无串行循环，无 OOM
-- **真·加速**：长序列（>8k tokens）实测超越 SDPA
+- **SM120 native optimization**: compiled `flex_attention` kernel — no serial loop, no OOM
+- **Real speedup**: measured faster than SDPA on long sequences (>8k tokens)
 
-| 序列长度 | SDPA | 本插件 | 加速 | 稀疏度 |
-|---------|------|--------|------|--------|
+| Sequence | SDPA | This plugin | Speedup | Density |
+|---------|------|-------------|---------|---------|
 | 4096  | 2.35ms | 1.61ms | 1.46x | 0.15 |
 | 8192  | 9.24ms | 2.35ms | 3.93x | 0.11 |
 | 16384 | 36.47ms | 5.28ms | 6.91x | 0.09 |
 | 32768 | 144.5ms | 16.06ms | 9.00x | 0.08 |
 
-（MiniMax H3 实际配置：H=56 头、bfloat16、BTHD 布局，预热后数据）
+(MiniMax H3's real config: H=56 heads, bfloat16, BTHD layout, post-warmup)
 
-- **自动回退**：`flex_attention` → Triton 参考内核 → 标准 SDPA，失败不影响生成
-- **零编译依赖**：为 SM120 设计的纯 Python + torch 方案，不需要 CUTLASS / CuTe DSL
+- **Automatic fallback**: `flex_attention` → Triton reference kernel → standard SDPA; failures never interrupt generation
+- **Zero compile-time dependencies**: pure Python + torch for SM120 — no CUTLASS / CuTe DSL required
 
-## 环境要求
+## Platform & GPU Compatibility
 
-- NVIDIA RTX 5090 (SM120) 或其它 Blackwell consumer GPU
-- **PyTorch ≥ 2.6**（flex_attention 完整性能需要；实测基于 2.11.0+cu130）
+- **Cross-platform**: the code is OS-agnostic (no hardcoded Linux paths). Works on **Windows**, Linux, and macOS.
+- **GPU**: acceleration requires **RTX 5090 (SM120)** or another Blackwell consumer GPU.
+  - Other GPUs (H100/SM90, B200/SM100, RTX 40/30-series) still run correctly but **fall back to SDPA** (no speedup) — this release ships only the SM120 backend.
+- **PyTorch ≥ 2.6** is required for full `flex_attention` performance (tested on 2.11.0+cu130).
+- **Note for Windows users**: the bundled `inductor_fix.py` only acts when it detects a stale torch 2.11 install bug; on a normal install it is a no-op.
+
+## Requirements
+
+- NVIDIA RTX 5090 (SM120) or other Blackwell consumer GPU
+- **PyTorch ≥ 2.6** (tested on 2.11.0+cu130)
 - CUDA 12.x / 13.x
 - ComfyUI
 
-## 安装
+## Installation
 
-1. 将本目录放到 ComfyUI 的插件目录：
+1. Place this folder in ComfyUI's custom nodes directory:
 
 ```bash
 cd ComfyUI/custom_nodes/
-git clone https://github.com/<你的用户名>/ComfyUI-SolAttn.git
+git clone https://github.com/KingGore/ComfyUI_sol-attn_Blackwell.git
 ```
 
-或手动下载整个目录，放到 `ComfyUI/custom_nodes/` 下（目录名需为 `ComfyUI-SolAttn`）。
+Or download the whole folder and place it under `ComfyUI/custom_nodes/` (the folder should be named `ComfyUI_sol-attn_Blackwell`).
 
-2. 重启 ComfyUI（无需额外 pip 安装，依赖已随 torch 内置）。
+2. Restart ComfyUI (no pip install needed — dependencies are bundled with torch).
 
-启动日志应出现：
+On startup the log should show:
 
 ```
 [Sol-Attn] ✓ GPU: NVIDIA GeForce RTX 5090 (SM120) — Sol-Attn via flex_attention (Python) path
 [SolAttnFlex] flex_attention kernel compiled (warmup done)
 ```
 
-## 使用
+## Usage
 
-在 MiniMax H3 工作流中加入节点 **Sol-Attn MiniMax H3 Patcher 🚀**：
-
-```
-[Load Diffusion Model] → [Sol-Attn MiniMaxH3 Patcher] → [KSampler / 采样节点]
-```
-
-节点参数：
-
-| 参数 | 默认 | 说明 |
-|------|------|------|
-| `enabled` | true | 是否启用 |
-| `tau` | 1.0 | 稀疏化温度，越大跳过越多 KV 块（更快但精度下降），推荐 0.8~1.5 |
-| `thresh_type` | diag | 阈值估算方式，`diag` 更快，`exact` 更精确 |
-
-## 工作原理
-
-Sol-Attn 的核心思想：用每个 KV 块的均值向量 `kc` 做廉价路由，筛出"重要"的 KV 块，只对它们做精确 attention。
-
-本插件把路由决策在 128-token 粒度上用纯 torch 计算，然后用 `flex_attention` 的编译内核执行被选中的块。相比原始 Sol-Attn 的 Triton 参考实现（串行处理每个 KV 块、慢 3~17 倍甚至 OOM），本方案在 SM120 上得到了规格化的 FlashAttention-3 性能。
-
-## 文件结构
+Add the node **Sol-Attn MiniMax H3 Patcher 🚀** to your MiniMax H3 workflow:
 
 ```
-ComfyUI-SolAttn/
-├── __init__.py          # 插件入口：inductor fix + flex 预热 + 节点注册
-├── inductor_fix.py      # 修复 torch 2.11 的 torch.compile 崩溃（duplicate template）
-├── sol_attn_flex.py     # SM120 主后端（flex_attention + Sol-Attn 路由）
-├── minimax_h3_patch.py  # MiniMax H3 的 optimized_attention_override 钩子
-├── sol_attn_node.py     # ComfyUI 节点
-├── sol_attn_loader.py   # 加载器（含回退）
+[Load Diffusion Model] → [Sol-Attn MiniMaxH3 Patcher] → [KSampler / sampler node]
+```
+
+Node parameters:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `enabled` | true | Enable / disable |
+| `tau` | 1.0 | Sparsity temperature; larger = skip more KV blocks (faster but less accurate). Recommended 0.8–1.5 |
+| `thresh_type` | diag | Threshold estimation; `diag` is faster, `exact` is more precise |
+
+## How It Works
+
+Sol-Attn's core idea: use each KV block's mean vector `kc` for a cheap routing pass, identify the "important" KV blocks, and only compute exact attention over those.
+
+This plugin computes the routing decision at 128-token granularity in pure torch, then executes the selected blocks with `flex_attention`'s compiled kernel. Compared to the original Sol-Attn Triton reference implementation (which processes each KV block serially — 3–17x slower and sometimes OOM), this approach achieves full FlashAttention-3 performance on SM120.
+
+## File Structure
+
+```
+ComfyUI_sol-attn_Blackwell/
+├── __init__.py          # Plugin entry: inductor fix + flex warmup + node registration
+├── inductor_fix.py      # Fixes a torch 2.11 torch.compile crash (duplicate template)
+├── sol_attn_flex.py     # SM120 main backend (flex_attention + Sol-Attn routing)
+├── minimax_h3_patch.py  # MiniMax H3 optimized_attention_override hook
+├── sol_attn_node.py     # ComfyUI nodes
+├── sol_attn_loader.py   # Loader (with fallback)
 └── sol_attn/
     ├── __init__.py
     ├── interface.py
     ├── preprocess.py
     └── triton_ref/
-        └── fwd.py       # 回退后端（Triton 参考实现）
+        └── fwd.py       # Fallback backend (Triton reference)
 ```
 
-## 已知限制
+## Known Limitations
 
-- 本版本针对 **SM120 (RTX 5090)** 和 **MiniMax H3**。H100 (SM90) / B200 (SM100) 的 CuTe DSL 后端不在本仓库中。
-- 仅拦截 MiniMax H3 的 self-attention（`skip_reshape=True` + head_dim=128 + bfloat16）。跨注意力、其它 dtype 自动回退。
-- 首次生成有一次 `torch.compile` 编译延迟（插件启动时已预热，约 3-4s）。
+- This release targets **SM120 (RTX 5090)** and **MiniMax H3**. The H100 (SM90) / B200 (SM100) CuTe DSL backends are not included.
+- Only MiniMax H3 self-attention is intercepted (`skip_reshape=True` + head_dim=128 + bfloat16). Cross-attention and other dtypes fall back automatically.
+- The first generation has a one-time `torch.compile` latency (pre-warmed at plugin startup, ~3–4s).
 
-## 参考
+## References
 
-- [Sol-Attn 论文](https://arxiv.org/abs/2501.17209)
-- [NVLabs/Sana 源码](https://github.com/NVlabs/Sana)
-- [PyTorch flex_attention 文档](https://pytorch.org/docs/stable/nn.attention.flex_attention.html)
+- [Sol-Attn paper](https://arxiv.org/abs/2501.17209)
+- [NVLabs/Sana source](https://github.com/NVlabs/Sana)
+- [PyTorch flex_attention docs](https://pytorch.org/docs/stable/nn.attention.flex_attention.html)
