@@ -30,6 +30,11 @@ import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
+# 诊断日志开关：设 COMFYUI_SOL_ATTN_DEBUG=1 时打印每次调用的序列长度/显存/稀疏密度。
+# 默认关闭，避免刷屏。
+import os as _os
+_DEBUG = _os.environ.get("COMFYUI_SOL_ATTN_DEBUG", "0") == "1"
+
 # flex_attention compiled-kernel block size. 128 is the minimum the kernel
 # accepts (BLOCK_M/BLOCK_N are 128).
 FLEX_BLOCK = 128
@@ -70,12 +75,21 @@ def _build_routing(
     scale: float,
     tau: float,
     device: torch.device,
+    sink_tokens: int = 0,     # exact-KV sink region (text/cond/audio rows) in tokens
+    dense_sink_rows: bool = False,  # also run sink query rows dense (exact_kv_and_rows)
 ):
     """Return (kv_num_blocks, kv_indices, mask_mod) for the Sol-Attn mask.
 
     Faithful to the Sol-Attn diag threshold: a KV block is kept if its pilot
     score ``q_bar @ kc`` exceeds ``mean + tau * std`` of the query-block
     score distribution, plus the local diagonal window (always exact).
+
+    ``sink_tokens`` (exact_kv): the first ``sink_tokens`` rows are an exact
+    KV sink — every query sees their KV blocks exactly. This is the packed
+    text/cond/reference rows the model must attend to faithfully.
+    ``dense_sink_rows`` (exact_kv_and_rows): additionally runs those sink
+    query rows fully dense (they see every KV block), so a generated stream
+    living inside the sink region (e.g. the H3 audio rows) is exact.
     """
     B, H, T_pad, D = q_h.shape
     n_blocks = T_pad // FLEX_BLOCK
@@ -100,6 +114,18 @@ def _build_routing(
     kb = block_idx.view(1, 1, 1, n_blocks)
     diag = (qb - kb).abs() <= 1  # local window always exact
     selected = exact | diag
+
+    # exact-KV sink: the sink KV blocks are always selected for every query.
+    # The sink is a prefix of the sequence, so round UP to the block boundary
+    # (the flex kernel is 128-token block granular) to cover the whole region.
+    sink_blocks = (min(sink_tokens, T) + FLEX_BLOCK - 1) // FLEX_BLOCK
+    if sink_blocks > 0:
+        sink_sel = kb < sink_blocks  # [1, 1, 1, N]
+        selected = selected | sink_sel
+        if dense_sink_rows:
+            # dense sink query rows: those rows see every KV block.
+            q_sink = (qb < sink_blocks)  # [1, 1, N, 1]
+            selected = selected | q_sink
 
     kv_num_blocks = selected.sum(dim=-1).to(torch.int32)  # [B, H, N]
     # Space-fill to the FULL N columns (like create_block_mask).  The kernel
@@ -141,6 +167,8 @@ def sol_attn_flex(
     scale: float | None = None,
     tau: float = 1.0,
     thresh_type: str = "diag",
+    sink_tokens: int = 0,
+    dense_sink_rows: bool = False,
 ) -> torch.Tensor:
     """Compute noncausal Sol-Attn for contiguous BF16 BTHD tensors on SM120.
 
@@ -151,6 +179,9 @@ def sol_attn_flex(
         thresh_type: accepted for API compatibility; routing uses the diag
             threshold (the ``"exact"`` full-covariance variant adds negligible
             routing benefit and extra cost here).
+        sink_tokens: exact-KV sink region (first ``sink_tokens`` rows) that
+            every query attends to exactly. 0 = disabled.
+        dense_sink_rows: also run the sink query rows fully dense.
 
     Returns:
         The attention output in BTHD format, same shape as ``q``.
@@ -167,11 +198,23 @@ def sol_attn_flex(
     batch, T, H, D = q.shape
     scale = D ** -0.5 if scale is None else float(scale)
     tau = float(tau)
+    sink_tokens = int(sink_tokens)
+    if sink_tokens < 0 or sink_tokens > T:
+        raise ValueError(f"sink_tokens must be in [0, T], got {sink_tokens}")
+    dense_sink_rows = bool(dense_sink_rows)
 
     if T == 0:
         return q.clone()
 
     device = q.device
+    # --- 诊断日志（默认关闭；设 COMFYUI_SOL_ATTN_DEBUG=1 开启） ---
+    if _DEBUG:
+        _free_mb = torch.cuda.mem_get_info(device)[0] / (1024 ** 2)
+        logger.info(
+            f"[SolAttnFlex] call q={tuple(q.shape)} | free_vram={_free_mb:.0f}MB | "
+            f"tau={tau} | thresh={thresh_type}"
+        )
+
     # Pad to a multiple of FLEX_BLOCK so the compiled kernel is happy.
     T_pad = ((T + FLEX_BLOCK - 1) // FLEX_BLOCK) * FLEX_BLOCK
     if T_pad != T:
@@ -187,8 +230,17 @@ def sol_attn_flex(
 
     kv_num_blocks, indices, mask_mod = _build_routing(
         q_h, k_h, T, scale, tau, device,
+        sink_tokens=sink_tokens, dense_sink_rows=dense_sink_rows,
     )
     block_mask = _center_block_mask(kv_num_blocks, indices, T_pad, mask_mod)
+
+    # --- 诊断日志（默认关闭） ---
+    if _DEBUG:
+        _density = kv_num_blocks.float().mean().item() / (T_pad // FLEX_BLOCK)
+        logger.info(
+            f"[SolAttnFlex] density={_density:.3f} (skip {100*(1-_density):.1f}% KV blocks) | "
+            f"n_blocks={T_pad//FLEX_BLOCK} | pad={T_pad-T}"
+        )
 
     try:
         out = _get_compiled_flex()(q_h, k_h, v_h, block_mask=block_mask, scale=scale)

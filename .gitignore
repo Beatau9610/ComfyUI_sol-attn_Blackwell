@@ -1,0 +1,12 @@
+# Ignore Python caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Local dev artifacts (not part of the published plugin)
+*.bak
+sm120_workaround.py
+sm120_patch.py
+=3.5.0

@@ -232,6 +232,48 @@ class SolAttnMiniMaxH3Patcher:
                         "exact: 全协方差估算，阈值更精确但预处理略慢。"
                     ),
                 }),
+                "exact_mode": (["off", "exact_kv", "exact_kv_and_rows"], {
+                    "default": "off",
+                    "tooltip": (
+                        "MiniMax-H3 打包序列的前缀（text/cond/参考/audio 行）精确模式。"
+                        "off: 纯稀疏。"
+                        "exact_kv: 前缀 KV 行对每个 query 精确保留（约 +3% 成本）。"
+                        "exact_kv_and_rows: 额外把前缀 query 行也跑成 dense，"
+                        "使生成的 audio 流完全精确（约 +20% 成本）。对其它模型无影响。"
+                    ),
+                }),
+                "dense_steps": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 100,
+                    "step": 1,
+                    "tooltip": (
+                        "前 N 个采样步强制走全量 dense（不做稀疏）。"
+                        "采样末尾的噪声最弱，稀疏误差最容易被看见；"
+                        "设为 1 可让最后一步（或末尾几步）完全精确。"
+                    ),
+                }),
+                "step_off": ("FLOAT", {
+                    "default": 0.0,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.05,
+                    "tooltip": (
+                        "按 sigma 阈值把采样末尾的步骤强制 dense。"
+                        "值越大覆盖的末尾步越多：1.0=最后一步，0.5≈最后 25%。"
+                        "0=关闭。"
+                    ),
+                }),
+                "sink_tokens": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 1000000,
+                    "step": 128,
+                    "tooltip": (
+                        "精确前缀 token 数（exact_mode 用）。0 时自动从 H3 打包"
+                        "布局推导（video 段起点）。通常无需手动设置。"
+                    ),
+                }),
             },
         }
 
@@ -243,16 +285,24 @@ class SolAttnMiniMaxH3Patcher:
         "相比 Flash Attention，Sol-Attn 在长序列（>8k tokens）上可额外节省 30-50% 计算量。"
     )
 
-    def patch(self, model, enabled: bool, tau: float, thresh_type: str):
+    def patch(self, model, enabled: bool, tau: float, thresh_type: str,
+              exact_mode: str, dense_steps: int, step_off: float,
+              sink_tokens: int):
         if not enabled:
             logger.info("[SolAttnMiniMaxH3Patcher] 已禁用，返回原始模型")
             return (model,)
         try:
             from minimax_h3_patch import patch_minimax_h3
-            patched = patch_minimax_h3(model, tau=tau, thresh_type=thresh_type)
+            patched = patch_minimax_h3(
+                model, tau=tau, thresh_type=thresh_type,
+                dense_steps=dense_steps, step_off=step_off,
+                exact_mode=exact_mode, sink_tokens=sink_tokens,
+            )
             logger.info(
                 f"[SolAttnMiniMaxH3Patcher] ✓ Sol-Attn 注入成功 "
-                f"| tau={tau} | thresh_type={thresh_type}"
+                f"| tau={tau} | thresh_type={thresh_type} | exact_mode={exact_mode} "
+                f"| dense_steps={dense_steps} | step_off={step_off} "
+                f"| sink_tokens={sink_tokens}"
             )
             return (patched,)
         except Exception as e:
