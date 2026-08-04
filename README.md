@@ -145,6 +145,6 @@ Big thanks to **[@Kijai](https://github.com/kijai)** for the two design suggesti
 
 ## References
 
-- [Sol-Attn paper](https://arxiv.org/abs/2501.17209)
+- [Sol-Attn paper](https://arxiv.org/abs/2607.24027)
 - [NVLabs/Sana source](https://github.com/NVlabs/Sana)
 - [PyTorch flex_attention docs](https://pytorch.org/docs/stable/nn.attention.flex_attention.html)
