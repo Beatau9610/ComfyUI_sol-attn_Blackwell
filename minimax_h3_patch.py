@@ -119,9 +119,24 @@ def _make_forward_wrapper(
         minimax_payload=None,
         **kwargs,
     ):
+        to = transformer_options
+
+        # 需要知道总步数；transformer_options["sample_sigmas"] 是完整调度
+        # （长度 = 步数 + 1，末尾补 0）。采样 loop 跑 total-1 步。
+        total = len(to.get("sample_sigmas", []))
+        n_steps = max(1, total - 1)
+
+        # 关键：DIFFUSION_MODEL wrapper 是在节点首次执行时创建一次，之后被
+        # ComfyUI 的节点输出缓存复用（输入不变时不会重新执行节点），所以闭包
+        # 里的 step_counter 会跨多个采样 run 一直累加、从不归零。若不重置，
+        # 第二次及以后的 run 里 step 会一直落在「末尾 dense」窗口（step >
+        # n_steps - need）内，导致每一次 forward 都走全量 dense——速度退回
+        # 没开 Sol-Attn 的水平，画质也与原始一致。这里按调度长度把计数器归零，
+        # 让每个 run 独立从 1 计数。
+        if step_counter["n"] >= n_steps:
+            step_counter["n"] = 0
         step_counter["n"] += 1
         step = step_counter["n"]
-        to = transformer_options
 
         # 从 layout 里取 sink_tokens（video 段起点 = 前缀 = text+cond+ref+audio）。
         # t2va 布局: [text | audio | video]；ref2va: [text | refs | audio | video]。
@@ -140,10 +155,6 @@ def _make_forward_wrapper(
 
         # 本步是否走 dense（末尾段）
         force_dense = False
-        # 需要知道总步数；transformer_options["sample_sigmas"] 是完整调度
-        # （长度 = 步数 + 1，末尾补 0）。采样 loop 跑 total-1 步。
-        total = len(to.get("sample_sigmas", []))
-        n_steps = max(1, total - 1)
         need = _trailing_dense_steps(n_steps, dense_steps, step_off)
         if need > 0:
             # 末尾 need 步 dense：step 从 n_steps-need+1 到 n_steps
